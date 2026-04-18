@@ -38,6 +38,9 @@ prepare_data
 
 .venv/
 .pyxbld/
+calib/tensors/
+calib/images/
+calib/audios/
 
 !example/audio.wav
 !example/image.png

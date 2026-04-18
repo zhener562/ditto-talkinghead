@@ -1,0 +1,20 @@
+"""Decoder FP8 weight-only (DQ-only mode)."""
+import numpy as np, pathlib
+from modelopt.onnx.quantization import quantize
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+data = np.load(str(ROOT / "calib/tensors/decoder_calib.npz"))["feature"].astype(np.float32)
+idxs = np.linspace(0, data.shape[0]-1, 128).astype(int)
+data = data[idxs]
+
+quantize(
+    onnx_path=str(ROOT / "checkpoints/ditto_onnx/decoder.onnx"),
+    quantize_mode="fp8",
+    calibration_data={"feature": data},
+    calibration_method="max",
+    dq_only=True,  # weight-only: keep DQ nodes, remove Q on activations
+    output_path=str(ROOT / "checkpoints/ditto_onnx/decoder_fp8_wonly.onnx"),
+    high_precision_dtype="fp16",
+    log_level="INFO",
+)
+print("Done.")

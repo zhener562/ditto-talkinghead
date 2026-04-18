@@ -10,7 +10,8 @@ TensorRT 10 / CUDA 12.8 移植メモ。2026-04-19 時点。
 | + torch.compile (warp+decode, warmup) | 19.15s | 0.82x | 1.20x |
 | TRT 10 全体 + PyTorch warp | 19.25s | 0.82x | 1.20x |
 | TRT 10 + torch.compile(warp) | 14.04s | 1.12x | 1.64x |
-| **pure TRT 10 (warp plugin 自前ビルド)** | **9.26s** | **1.70x** | **2.49x** |
+| pure TRT 10 (warp plugin 自前ビルド) | 9.26s | 1.70x | 2.49x |
+| **TRT 10 FP8 (decoder+warp QDQ)** | **7.51s** | **2.10x** | **3.07x** (PSNR Y=39.5dB) |
 
 ピーク VRAM は PyTorch 版で 1.45 GB。TRT 化後は計測未、ただし engines 合計 ~550MB。
 
@@ -241,6 +242,42 @@ polygraphy convert warp_network.onnx -o warp_network_fp16.engine \
 8. cfg を純 TRT 用に戻す（`v0.4_hubert_cfg_trt_bw_pure.pkl`）
 
 ビルド注意点: `IPluginV2` / `registerCreator` は TRT 10 で deprecated 警告が出るが動作する。将来 `IPluginV3` 化すれば警告が消えて綺麗。
+
+## FP8 量子化（3.07x baseline 達成）
+
+### データセット
+
+Seedream v4 (WaveSpeed API) で多様な日本人・アジア人の顔画像 15 枚を生成、VoiceVox で 9 話者 × 10 テキスト = 18 本の音声を用意。16×2 = 32 ラン × 20 フレーム subsample = **640 サンプル** を中間テンソルとして保存。
+
+- `scripts/gen_calib_images.py`: seedream 画像生成
+- `scripts/gen_calib_audios.py`: VoiceVox TTS 生成
+- `scripts/dump_calib_tensors.py`: pipeline 走らせて warp/decoder 入力を `.npz` に dump
+- 出力: `calib/tensors/{warp,decoder}_calib.npz`（3.8GB, gitignore）
+
+### 発見したバグ (modelopt の fp16 オーバーフロー)
+
+`modelopt.onnx.quantization.fp8.py:72` の:
+```python
+np_fp8_scale = (np_scale * 448.0) / 127.0
+```
+`np_scale` が fp16 だと `scale × 448 > 65504` で **inf 化** → 後続で nan 連鎖 → decoder 出力が真っ白に saturate。
+
+修正パッチ（`.venv/` 内、要再適用）:
+```python
+np_fp8_scale = (np_scale.astype(np.float32) * 448.0) / 127.0
+```
+
+症状: 4つの異なる FP8 変種（max/entropy キャリブ × 全量子化/SPADE除外 × weight-only）で **全て同一の壊れた出力** (md5 一致)。これが「全層 inf スケール」を示す決定的証拠だった。
+
+### QDQ 挿入手順
+
+1. `scripts/fp8_quantize_decoder.py`: modelopt で decoder.onnx → decoder_fp8_qdq.onnx（109 ノード QDQ 挿入, 256 サンプル max キャリブ, 4分）
+2. `scripts/fp8_quantize_warp.py`: 同様に warp_network.onnx → warp_network_fp8_qdq.onnx（18 ノード, GridSample3D カスタム op は `trt_plugins` で ORT に通知, 20秒）
+3. `polygraphy convert *.onnx -o *_fp8.engine --strongly-typed --builder-optimization-level=5`（QDQ を尊重するために **strongly-typed 必須**、`--fp8 --fp16` だと TRT が勝手に全層 FP8 化）
+
+### 品質検証
+
+PSNR (Y channel) = **39.47 dB** (FP16 基準)。40dB 超はプロ水準の無劣化。視覚的に区別不可能。
 
 ## 新しい律速 (pure TRT)
 
