@@ -36,5 +36,8 @@ log/*
 
 prepare_data
 
+.venv/
+.pyxbld/
+
 !example/audio.wav
 !example/image.png
