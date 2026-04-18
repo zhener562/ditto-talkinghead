@@ -24,6 +24,14 @@ except ImportError:
 logger = trt.Logger(trt.Logger.ERROR)
 trt.init_libnvinfer_plugins(logger, "")
 
+# Auto-load custom plugins (GridSample3D for Blackwell TRT 10 build)
+_gs3d = os.environ.get(
+    "DITTO_GS3D_PLUGIN",
+    "/home/zhener/ドキュメント/github/grid-sample3d-trt-plugin/build_trt10/libgrid_sample_3d_plugin.so",
+)
+if os.path.exists(_gs3d):
+    ctypes.CDLL(_gs3d)
+
 
 def _cudaGetErrorEnum(error):
     if isinstance(error, cuda.CUresult):

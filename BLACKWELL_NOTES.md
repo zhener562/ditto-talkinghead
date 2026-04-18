@@ -9,8 +9,8 @@ TensorRT 10 / CUDA 12.8 移植メモ。2026-04-19 時点。
 | baseline PyTorch (eager, cu128) | 23.04s | 0.68x | 1.00x |
 | + torch.compile (warp+decode, warmup) | 19.15s | 0.82x | 1.20x |
 | TRT 10 全体 + PyTorch warp | 19.25s | 0.82x | 1.20x |
-| **TRT 10 + torch.compile(warp)** | **14.04s** | **1.12x** | **1.64x** |
-| (射程) TRT 10 + GridSample3D plugin | ~9s | ~1.7x | ~2.5x |
+| TRT 10 + torch.compile(warp) | 14.04s | 1.12x | 1.64x |
+| **pure TRT 10 (warp plugin 自前ビルド)** | **9.26s** | **1.70x** | **2.49x** |
 
 ピーク VRAM は PyTorch 版で 1.45 GB。TRT 化後は計測未、ただし engines 合計 ~550MB。
 
@@ -209,9 +209,49 @@ polygraphy convert warp_network.onnx -o warp_network_fp16.engine \
 ### どれを最優先でやるか
 
 コスパ順:
-1. **GridSample3D plugin ビルド + 統合**（半日、期待 +10%、PyTorch 依存を外せるので配布容易に）
-2. **writer を nvenc に** （2-3時間、期待 +20-30% で writer bottleneck 解消）
-3. **FP8 量子化**（1-2日、期待 +50-100%、Blackwell の真価）
+1. ~~**GridSample3D plugin ビルド + 統合**~~ → **完了**（1時間、+50% で 1.12→1.70x realtime）
+2. **FP8 量子化**（1-2日、期待 +50-100%、Blackwell の真価、3-4x realtime 射程）
+3. **GPU putback**（数時間、putback 6ms/frame を CUDA 化、律速じゃないので効果小）
+
+## プラグインビルド手順（完了記録）
+
+1. `nvcc 12.8` が必要。micromamba でサンドボックス:
+   ```bash
+   export MAMBA_ROOT_PREFIX=$HOME/.local/share/micromamba
+   ~/.local/bin/micromamba create -n cuda128 -c conda-forge "cuda-nvcc=12.8" "cuda-cccl=12.8" -y
+   ```
+2. TRT 10 headers を公式 OSS から取得（pip wheel には入ってない）:
+   ```bash
+   git clone --depth=1 --branch release/10.16 https://github.com/NVIDIA/TensorRT.git /tmp/trt-oss
+   cp /tmp/trt-oss/include/*.h ~/ドキュメント/github/grid-sample3d-trt-plugin/trt10_include/
+   ```
+3. `tensorrt_libs/` の `libnvinfer.so.10` に `libnvinfer.so` シンボリックリンク（リンカ用）
+4. CMakeLists.txt を一部改修（`CMAKE_CUDA_ARCHITECTURES` 外部指定可、`target_link_directories` 追加、`test/` を opt-in）
+5. cmake + build
+   ```bash
+   cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120 \
+     -DCMAKE_CUDA_COMPILER=$HOME/.local/share/micromamba/envs/cuda128/bin/nvcc \
+     -DCUDAToolkit_ROOT=$HOME/.local/share/micromamba/envs/cuda128 \
+     -DTensorRT_INCLUDE_DIR=.../trt10_include \
+     -DTensorRT_LIB_DIR=.../tensorrt_libs
+   cmake --build . -j
+   ```
+6. 生成された `libgrid_sample_3d_plugin.so` を `core/utils/tensorrt_utils.py` 冒頭で `ctypes.CDLL(...)` ロード（環境変数 `DITTO_GS3D_PLUGIN` で上書き可）
+7. `warp_network.onnx`（カスタム GridSample3D op 版）を `polygraphy convert --plugins <so>` で engine 化
+8. cfg を純 TRT 用に戻す（`v0.4_hubert_cfg_trt_bw_pure.pkl`）
+
+ビルド注意点: `IPluginV2` / `registerCreator` は TRT 10 で deprecated 警告が出るが動作する。将来 `IPluginV3` 化すれば警告が消えて綺麗。
+
+## 新しい律速 (pure TRT)
+
+| ステージ | mean | vs baseline |
+|---|---:|---|
+| warp (TRT plugin) | **18.94 ms** | 50→19ms (2.6x) |
+| decode (TRT FP16) | 19.47 ms | 31→19ms (1.6x) = **現律速** |
+| putback (CPU) | 6.35 ms | 不変 |
+| writer (ffmpeg) | 2.05 ms | 不変 |
+
+warp と decode が 19ms で均衡。次に効くのは **FP8 で decoder を半減**。
 
 ---
 
