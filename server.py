@@ -44,6 +44,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 
 import json
+import re
 import urllib.error
 import urllib.request
 
@@ -608,8 +609,80 @@ def _build_tts_request(req: DittoTtsAvatarRequest) -> tuple[str, dict, int]:
     raise HTTPException(400, f"unknown tts_backend: {backend}")
 
 
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[。．！？!?])\s*")
+
+
+def _split_sentences_for_xtts(text: str) -> list[str]:
+    parts = _SENTENCE_SPLIT_RE.split(text.strip())
+    return [p.strip() for p in parts if p and p.strip()]
+
+
+def _stream_xtts_per_sentence(req: DittoTtsAvatarRequest):
+    """XTTS は inference_stream() が GPT トークン単位で多数のチャンクを返すため、
+    そのまま ditto に流すとサブチャンク境界ごとに offline パイプラインが回って
+    再生がカクつく。ここで文単位に分割して各文を別リクエストで投げ、返ってきた
+    チャンク群を 1 本の WAV に結合してから yield する。
+    """
+    sentences = _split_sentences_for_xtts(req.text)
+    if not sentences:
+        return
+    for sentence in sentences:
+        payload = {
+            "text": sentence,
+            "voice": req.voice,
+            "language": req.language or "ja",
+            "speed": req.speed or 1.0,
+        }
+        data = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
+            f"{TTS_SERVER_URL}/xtts/tts/stream",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            resp = urllib.request.urlopen(request, timeout=120)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            raise HTTPException(502, f"tts_server xtts HTTP {e.code}: {body}") from e
+        except urllib.error.URLError as e:
+            raise HTTPException(502, f"tts_server unreachable: {e}") from e
+
+        audio_parts: list[np.ndarray] = []
+        sample_rate: Optional[int] = None
+        with resp:
+            buf = bytearray()
+            while True:
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                buf.extend(chunk)
+                while len(buf) >= 4:
+                    length = int.from_bytes(bytes(buf[:4]), "big")
+                    if len(buf) < 4 + length:
+                        break
+                    wav = bytes(buf[4 : 4 + length])
+                    del buf[: 4 + length]
+                    audio, sr = sf.read(io.BytesIO(wav))
+                    if audio.ndim > 1:
+                        audio = audio.mean(axis=1)
+                    audio_parts.append(audio.astype(np.float32))
+                    sample_rate = sr
+        if not audio_parts or sample_rate is None:
+            continue
+        merged = np.concatenate(audio_parts)
+        out = io.BytesIO()
+        sf.write(out, merged, sample_rate, format="WAV", subtype="PCM_16")
+        yield out.getvalue()
+
+
 def _stream_tts_wavs(req: DittoTtsAvatarRequest):
     """Yield (wav_bytes) per sentence from tts_server. Blocking generator."""
+    backend = (req.tts_backend or "kokoro").lower()
+    if backend == "xtts":
+        yield from _stream_xtts_per_sentence(req)
+        return
+
     url, payload, _sr_hint = _build_tts_request(req)
     data = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
