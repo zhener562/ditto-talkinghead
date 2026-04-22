@@ -526,12 +526,12 @@ async def ditto_benchmark(avatar_id: str = "default", duration_s: float = 2.0):
 class DittoTtsAvatarRequest(BaseModel):
     text: str
     avatar_id: str
-    tts_backend: Optional[str] = "kokoro"  # kokoro | voicevox | xtts | sbv2 | irodori
+    tts_backend: Optional[str] = "kokoro"  # kokoro | voicevox | xtts | qwen3 | sbv2 | irodori
     voice: Optional[str] = None
     speed: Optional[float] = 1.0
     lang: Optional[str] = "j"
     caption: Optional[str] = None  # irodori
-    speaker: Optional[int] = None  # voicevox
+    speaker: Optional[str | int] = None  # voicevox | qwen3
     model_id: Optional[int] = None  # sbv2
     speaker_id: Optional[int] = None  # sbv2
     style: Optional[str] = None  # sbv2
@@ -581,6 +581,17 @@ def _build_tts_request(req: DittoTtsAvatarRequest) -> tuple[str, dict, int]:
             },
             24000,
         )
+    if backend == "qwen3":
+        return (
+            f"{TTS_SERVER_URL}/qwen3/tts/stream",
+            {
+                "text": req.text,
+                "language": req.language or "ja",
+                "speaker": str(req.speaker or req.voice or "Ono_Anna"),
+                "speed": req.speed or 1.0,
+            },
+            24000,
+        )
     if backend == "sbv2":
         return (
             f"{TTS_SERVER_URL}/sbv2/tts/stream",
@@ -612,30 +623,45 @@ def _build_tts_request(req: DittoTtsAvatarRequest) -> tuple[str, dict, int]:
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[。．！？!?])\s*")
 
 
-def _split_sentences_for_xtts(text: str) -> list[str]:
+def _split_sentences_for_chunky_tts(text: str) -> list[str]:
     parts = _SENTENCE_SPLIT_RE.split(text.strip())
     return [p.strip() for p in parts if p and p.strip()]
 
 
-def _stream_xtts_per_sentence(req: DittoTtsAvatarRequest):
-    """XTTS は inference_stream() が GPT トークン単位で多数のチャンクを返すため、
-    そのまま ditto に流すとサブチャンク境界ごとに offline パイプラインが回って
-    再生がカクつく。ここで文単位に分割して各文を別リクエストで投げ、返ってきた
-    チャンク群を 1 本の WAV に結合してから yield する。
+def _stream_chunky_tts_per_sentence(req: DittoTtsAvatarRequest):
+    """細粒度ストリーム系 TTS を文単位へ束ねて Ditto に渡す。
+
+    XTTS や Qwen3 は upstream が多数の短い WAV チャンクを返すため、そのまま
+    Ditto に流すとサブチャンク境界ごとに offline パイプラインが回って画面遷移が
+    細かくなりすぎる。ここで文単位に分割し、各文を別リクエストで投げて返ってきた
+    WAV 群を 1 本に結合してから yield する。
     """
-    sentences = _split_sentences_for_xtts(req.text)
+    backend = (req.tts_backend or "kokoro").lower()
+    sentences = _split_sentences_for_chunky_tts(req.text)
     if not sentences:
         return
     for sentence in sentences:
-        payload = {
-            "text": sentence,
-            "voice": req.voice,
-            "language": req.language or "ja",
-            "speed": req.speed or 1.0,
-        }
+        if backend == "xtts":
+            url = f"{TTS_SERVER_URL}/xtts/tts/stream"
+            payload = {
+                "text": sentence,
+                "voice": req.voice,
+                "language": req.language or "ja",
+                "speed": req.speed or 1.0,
+            }
+        elif backend == "qwen3":
+            url = f"{TTS_SERVER_URL}/qwen3/tts/stream"
+            payload = {
+                "text": sentence,
+                "language": req.language or "ja",
+                "speaker": str(req.speaker or req.voice or "Ono_Anna"),
+                "speed": req.speed or 1.0,
+            }
+        else:
+            raise HTTPException(400, f"unknown chunky tts_backend: {backend}")
         data = json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(
-            f"{TTS_SERVER_URL}/xtts/tts/stream",
+            url,
             data=data,
             headers={"Content-Type": "application/json"},
             method="POST",
@@ -644,7 +670,7 @@ def _stream_xtts_per_sentence(req: DittoTtsAvatarRequest):
             resp = urllib.request.urlopen(request, timeout=120)
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
-            raise HTTPException(502, f"tts_server xtts HTTP {e.code}: {body}") from e
+            raise HTTPException(502, f"tts_server {backend} HTTP {e.code}: {body}") from e
         except urllib.error.URLError as e:
             raise HTTPException(502, f"tts_server unreachable: {e}") from e
 
@@ -679,8 +705,8 @@ def _stream_xtts_per_sentence(req: DittoTtsAvatarRequest):
 def _stream_tts_wavs(req: DittoTtsAvatarRequest):
     """Yield (wav_bytes) per sentence from tts_server. Blocking generator."""
     backend = (req.tts_backend or "kokoro").lower()
-    if backend == "xtts":
-        yield from _stream_xtts_per_sentence(req)
+    if backend in {"xtts", "qwen3"}:
+        yield from _stream_chunky_tts_per_sentence(req)
         return
 
     url, payload, _sr_hint = _build_tts_request(req)
