@@ -628,13 +628,99 @@ def _split_sentences_for_chunky_tts(text: str) -> list[str]:
     return [p.strip() for p in parts if p and p.strip()]
 
 
-def _stream_chunky_tts_per_sentence(req: DittoTtsAvatarRequest):
-    """細粒度ストリーム系 TTS を文単位へ束ねて Ditto に渡す。
+_QWEN3_DITTO_BUFFER_INITIAL_SEC = float(
+    os.environ.get("QWEN3_DITTO_BUFFER_INITIAL_SEC", "1.0")
+)
+_QWEN3_DITTO_BUFFER_GROWTH = float(
+    os.environ.get("QWEN3_DITTO_BUFFER_GROWTH", "1.5")
+)
+_QWEN3_DITTO_BUFFER_MAX_SEC = float(
+    os.environ.get("QWEN3_DITTO_BUFFER_MAX_SEC", "3.0")
+)
 
-    XTTS や Qwen3 は upstream が多数の短い WAV チャンクを返すため、そのまま
-    Ditto に流すとサブチャンク境界ごとに offline パイプラインが回って画面遷移が
-    細かくなりすぎる。ここで文単位に分割し、各文を別リクエストで投げて返ってきた
-    WAV 群を 1 本に結合してから yield する。
+
+def _merge_parts_to_wav(parts: list[np.ndarray], sample_rate: int) -> bytes:
+    merged = np.concatenate(parts)
+    out = io.BytesIO()
+    sf.write(out, merged, sample_rate, format="WAV", subtype="PCM_16")
+    return out.getvalue()
+
+
+def _stream_qwen3_buffered_for_ditto(req: DittoTtsAvatarRequest):
+    """qwen3 を**全文 1 コール**で呼び、ストリーム出力を時間単位に束ねて Ditto に渡す。
+
+    文単位コールだと自己回帰状態が文ごとにリセットされて話者の声質・プロソディが
+    微妙に揺れる（vLLM-Omni のサンプリング乱数も別シード扱い）。全文を 1 回の
+    generate に通すことで decoder 状態を連続させたまま、Ditto 側の offline
+    パイプライン粒度だけを時間バッファで粗くする。
+
+    バッファ長は初回 `_QWEN3_DITTO_BUFFER_INITIAL_SEC` から `_QWEN3_DITTO_BUFFER_GROWTH`
+    倍ずつ成長させ、`_QWEN3_DITTO_BUFFER_MAX_SEC` で頭打ち。理由:
+      - 初回は TTFA 短縮のため小さめ
+      - Ditto RTF 0.5 なので後続チャンクを成長させても再生が追い付く
+      - 上限ありなので割り込み時の render ロスが限定される
+    """
+    url = f"{TTS_SERVER_URL}/qwen3/tts/stream"
+    payload = {
+        "text": req.text,
+        "language": req.language or "ja",
+        "speaker": str(req.speaker or req.voice or "Ono_Anna"),
+        "speed": req.speed or 1.0,
+    }
+    data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        resp = urllib.request.urlopen(request, timeout=120)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        raise HTTPException(502, f"tts_server qwen3 HTTP {e.code}: {body}") from e
+    except urllib.error.URLError as e:
+        raise HTTPException(502, f"tts_server unreachable: {e}") from e
+
+    buf_parts: list[np.ndarray] = []
+    buf_samples = 0
+    sample_rate: Optional[int] = None
+    target_sec = _QWEN3_DITTO_BUFFER_INITIAL_SEC
+    with resp:
+        buf = bytearray()
+        while True:
+            chunk = resp.read(65536)
+            if not chunk:
+                break
+            buf.extend(chunk)
+            while len(buf) >= 4:
+                length = int.from_bytes(bytes(buf[:4]), "big")
+                if len(buf) < 4 + length:
+                    break
+                wav = bytes(buf[4 : 4 + length])
+                del buf[: 4 + length]
+                audio, sr = sf.read(io.BytesIO(wav))
+                if audio.ndim > 1:
+                    audio = audio.mean(axis=1)
+                buf_parts.append(audio.astype(np.float32))
+                buf_samples += len(audio)
+                sample_rate = sr
+                if sample_rate and buf_samples / sample_rate >= target_sec:
+                    yield _merge_parts_to_wav(buf_parts, sample_rate)
+                    buf_parts = []
+                    buf_samples = 0
+                    target_sec = min(
+                        target_sec * _QWEN3_DITTO_BUFFER_GROWTH,
+                        _QWEN3_DITTO_BUFFER_MAX_SEC,
+                    )
+    if buf_parts and sample_rate is not None:
+        yield _merge_parts_to_wav(buf_parts, sample_rate)
+
+
+def _stream_chunky_tts_per_sentence(req: DittoTtsAvatarRequest):
+    """XTTS を文単位へ束ねて Ditto に渡す（voice clone 参照音声が固定のため
+    文ごと別コールでも声質は安定）。qwen3 は自己回帰の連続性を保つため
+    `_stream_qwen3_buffered_for_ditto` で処理するので通らない。
     """
     backend = (req.tts_backend or "kokoro").lower()
     sentences = _split_sentences_for_chunky_tts(req.text)
@@ -647,14 +733,6 @@ def _stream_chunky_tts_per_sentence(req: DittoTtsAvatarRequest):
                 "text": sentence,
                 "voice": req.voice,
                 "language": req.language or "ja",
-                "speed": req.speed or 1.0,
-            }
-        elif backend == "qwen3":
-            url = f"{TTS_SERVER_URL}/qwen3/tts/stream"
-            payload = {
-                "text": sentence,
-                "language": req.language or "ja",
-                "speaker": str(req.speaker or req.voice or "Ono_Anna"),
                 "speed": req.speed or 1.0,
             }
         else:
@@ -696,16 +774,16 @@ def _stream_chunky_tts_per_sentence(req: DittoTtsAvatarRequest):
                     sample_rate = sr
         if not audio_parts or sample_rate is None:
             continue
-        merged = np.concatenate(audio_parts)
-        out = io.BytesIO()
-        sf.write(out, merged, sample_rate, format="WAV", subtype="PCM_16")
-        yield out.getvalue()
+        yield _merge_parts_to_wav(audio_parts, sample_rate)
 
 
 def _stream_tts_wavs(req: DittoTtsAvatarRequest):
     """Yield (wav_bytes) per sentence from tts_server. Blocking generator."""
     backend = (req.tts_backend or "kokoro").lower()
-    if backend in {"xtts", "qwen3"}:
+    if backend == "qwen3":
+        yield from _stream_qwen3_buffered_for_ditto(req)
+        return
+    if backend == "xtts":
         yield from _stream_chunky_tts_per_sentence(req)
         return
 
