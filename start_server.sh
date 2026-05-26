@@ -20,4 +20,8 @@ PY
 PORT="${DITTO_PORT:-8881}"
 HOST="${DITTO_HOST:-0.0.0.0}"
 
+# Pin to GPU 1 (4000 BW, voice sanctuary). Override with CUDA_VISIBLE_DEVICES=0.
+export CUDA_DEVICE_ORDER="${CUDA_DEVICE_ORDER:-PCI_BUS_ID}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
+
 exec uvicorn server:app --host "$HOST" --port "$PORT" --log-level info
