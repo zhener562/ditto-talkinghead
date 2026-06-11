@@ -537,6 +537,7 @@ class DittoTtsAvatarRequest(BaseModel):
     style: Optional[str] = None  # sbv2
     language: Optional[str] = None  # xtts
     num_steps: Optional[int] = None  # irodori
+    seed: Optional[int] = None  # irodori (固定すると音声を決定論化、None で毎回ランダム)
     fps: Optional[int] = FPS
     jpeg_quality: Optional[int] = 85
 
@@ -624,6 +625,7 @@ def _build_tts_request(req: DittoTtsAvatarRequest) -> tuple[str, dict, int]:
                 "caption": req.caption,
                 "speed": req.speed or 1.0,
                 "num_steps": req.num_steps or 20,
+                "seed": req.seed,
             },
             48000,
         )
