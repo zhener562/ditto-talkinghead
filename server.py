@@ -526,7 +526,7 @@ async def ditto_benchmark(avatar_id: str = "default", duration_s: float = 2.0):
 class DittoTtsAvatarRequest(BaseModel):
     text: str
     avatar_id: str
-    tts_backend: Optional[str] = "kokoro"  # kokoro | voicevox | xtts | qwen3 | sbv2 | irodori
+    tts_backend: Optional[str] = "kokoro"  # kokoro | voicevox | aivis | xtts | qwen3 | sbv2 | irodori
     voice: Optional[str] = None
     speed: Optional[float] = 1.0
     lang: Optional[str] = "j"
@@ -569,6 +569,16 @@ def _build_tts_request(req: DittoTtsAvatarRequest) -> tuple[str, dict, int]:
                 "speed": req.speed or 1.0,
             },
             24000,
+        )
+    if backend == "aivis":
+        return (
+            f"{TTS_SERVER_URL}/aivis/tts/stream",
+            {
+                "text": req.text,
+                "speaker": int(req.speaker if req.speaker is not None else (req.voice or 888753760)),
+                "speed": req.speed or 1.0,
+            },
+            44100,
         )
     if backend == "xtts":
         return (
