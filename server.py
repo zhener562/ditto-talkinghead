@@ -25,6 +25,7 @@ import logging
 import math
 import os
 import queue as queue_mod
+import subprocess
 import shutil
 import struct
 import tempfile
@@ -66,6 +67,8 @@ CFG_PKL = os.environ.get(
 )
 AVATARS_DIR = Path(os.environ.get("DITTO_AVATARS_DIR", str(REPO_ROOT / "avatars")))
 AVATARS_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUTS_DIR = Path(os.environ.get("DITTO_OUTPUTS_DIR", str(REPO_ROOT / "outputs")))
+OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 AVATAR_CACHE_MAX = int(os.environ.get("DITTO_AVATAR_CACHE_MAX", "8"))
 TTS_SERVER_URL = os.environ.get("TTS_SERVER_URL", "http://localhost:8880").rstrip("/")
 TYPE_AUDIO = b"\x00"
@@ -127,6 +130,8 @@ class _FrameCaptureSDK(StreamSDK):
                     break
                 if self._frame_out_queue is not None:
                     self._frame_out_queue.put(item)
+                else:
+                    self.writer(item, fmt="rgb")
                 self.writer_pbar.update()
         finally:
             if self._frame_out_queue is not None:
@@ -331,6 +336,75 @@ def _encode_jpeg(rgb: np.ndarray, quality: int) -> Optional[bytes]:
     return buf.tobytes() if ok else None
 
 
+def _save_avatar_source(avatar_id: str, filename: str, content: bytes) -> str:
+    suffix = (Path(filename or "").suffix or ".png").lower()
+    if suffix not in IMAGE_EXTS:
+        raise HTTPException(400, f"unsupported extension: {suffix}")
+
+    avatar_dir = AVATARS_DIR / avatar_id
+    avatar_dir.mkdir(parents=True, exist_ok=True)
+    for p in avatar_dir.glob("source.*"):
+        p.unlink(missing_ok=True)
+    src_path = avatar_dir / f"source{suffix}"
+    src_path.write_bytes(content)
+    _cache_set(avatar_id, str(src_path))
+    return str(src_path)
+
+
+def _run_generate_mp4(avatar_id: str, audio: np.ndarray, output_path: Path) -> dict:
+    sdk = _require_ready()
+    src_path = _resolve_source(avatar_id)
+    if src_path is None:
+        raise HTTPException(404, f"Avatar '{avatar_id}' not prepared")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    num_f = max(1, math.ceil(len(audio) / AUDIO_SR * FPS))
+    t0 = time.perf_counter()
+
+    with _sdk_lock:
+        sdk._frame_out_queue = None
+        tmp_video = str(output_path) + ".tmp.mp4"
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as audio_file:
+            audio_path = Path(audio_file.name)
+        try:
+            sf.write(str(audio_path), audio, AUDIO_SR, format="WAV", subtype="PCM_16")
+            sdk.setup(src_path, str(output_path), online_mode=False)
+            sdk.setup_Nd(N_d=num_f)
+            aud_feat = sdk.wav2feat.wav2feat(audio)
+            sdk.audio2motion_queue.put(aud_feat)
+            sdk.close()
+
+            cmd = [
+                "ffmpeg", "-loglevel", "error", "-y",
+                "-i", tmp_video,
+                "-i", str(audio_path),
+                "-map", "0:v", "-map", "1:a",
+                "-c:v", "copy", "-c:a", "aac",
+                str(output_path),
+            ]
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            if res.returncode != 0:
+                raise RuntimeError(f"ffmpeg ditto mp4 mux failed: {res.stderr[-800:]}")
+        finally:
+            sdk._frame_out_queue = None
+            audio_path.unlink(missing_ok=True)
+            tmp = Path(tmp_video)
+            if tmp.exists():
+                tmp.unlink(missing_ok=True)
+
+    elapsed = time.perf_counter() - t0
+    size_bytes = output_path.stat().st_size if output_path.exists() else 0
+    return {
+        "avatar_id": avatar_id,
+        "output_path": str(output_path),
+        "fps": FPS,
+        "num_frames": num_f,
+        "elapsed_seconds": round(elapsed, 3),
+        "elapsed_ms": int(elapsed * 1000),
+        "size_bytes": size_bytes,
+    }
+
+
 # ─── Endpoints ────────────────────────────────────────────────────────────────
 
 
@@ -347,25 +421,38 @@ def health():
 @app.post("/ditto/prepare")
 async def ditto_prepare(file: UploadFile = File(...), avatar_id: str = Form(...)):
     content = await file.read()
-    suffix = (Path(file.filename or "").suffix or ".png").lower()
-    if suffix not in IMAGE_EXTS:
-        raise HTTPException(400, f"unsupported extension: {suffix}")
-
-    avatar_dir = AVATARS_DIR / avatar_id
-    avatar_dir.mkdir(parents=True, exist_ok=True)
-    # clear previous source files so we don't mix extensions
-    for p in avatar_dir.glob("source.*"):
-        p.unlink(missing_ok=True)
-    src_path = avatar_dir / f"source{suffix}"
-    src_path.write_bytes(content)
-
-    _cache_set(avatar_id, str(src_path))
+    src_path = _save_avatar_source(avatar_id, file.filename or "source.png", content)
+    suffix = Path(src_path).suffix.lower()
     return {
         "avatar_id": avatar_id,
         "source_path": str(src_path),
         "size_bytes": len(content),
         "kind": "video" if suffix in (".mp4", ".mov") else "image",
     }
+
+
+@app.post("/ditto/generate/mp4")
+async def ditto_generate_mp4(
+    file: UploadFile = File(...),
+    avatar_id: str = Form(...),
+    source_file: Optional[UploadFile] = File(None),
+    fps: int = Form(FPS),  # noqa: ARG001 — Ditto runtime is fixed at 25fps.
+    jpeg_quality: int = Form(90),  # noqa: ARG001 — kept for API symmetry.
+):
+    _require_ready()
+    if source_file is not None:
+        source_content = await source_file.read()
+        _save_avatar_source(avatar_id, source_file.filename or "source.png", source_content)
+
+    audio = _load_audio_16k(await file.read())
+    output_path = OUTPUTS_DIR / "studio" / f"{int(time.time() * 1000)}_{avatar_id}.mp4"
+    try:
+        return await asyncio.to_thread(_run_generate_mp4, avatar_id, audio, output_path)
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        logger.exception("ditto mp4 generate failed")
+        raise HTTPException(500, str(e)) from e
 
 
 @app.get("/ditto/avatars")
