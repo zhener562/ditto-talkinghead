@@ -627,6 +627,13 @@ class DittoTtsAvatarRequest(BaseModel):
     seed: Optional[int] = None  # irodori (固定すると音声を決定論化、None で毎回ランダム)
     fps: Optional[int] = FPS
     jpeg_quality: Optional[int] = 85
+    # qwen3-only: forwarded to tts_server's Qwen3TTSRequest. Server-side
+    # default is True (JA+EN mixed text splits into per-language runs
+    # for accurate pronunciation), at the cost of disabling chunk
+    # streaming on mixed input. Clients (e.g. kotonia-desktop's Iris
+    # coding persona) that prefer streaming first-byte latency over
+    # per-language pronunciation pass False.
+    split_mixed_languages: Optional[bool] = None
 
 
 def _build_tts_request(req: DittoTtsAvatarRequest) -> tuple[str, dict, int]:
@@ -680,14 +687,20 @@ def _build_tts_request(req: DittoTtsAvatarRequest) -> tuple[str, dict, int]:
             24000,
         )
     if backend == "qwen3":
+        qwen3_payload = {
+            "text": req.text,
+            "language": req.language or "ja",
+            "speaker": str(req.speaker or req.voice or "Ono_Anna"),
+            "speed": req.speed or 1.0,
+        }
+        # Forward the streaming-vs-fluency knob when the caller set it.
+        # `None` means "leave it off the wire and let tts_server use
+        # its own default (True)".
+        if req.split_mixed_languages is not None:
+            qwen3_payload["split_mixed_languages"] = req.split_mixed_languages
         return (
             f"{TTS_SERVER_URL}/qwen3/tts/stream",
-            {
-                "text": req.text,
-                "language": req.language or "ja",
-                "speaker": str(req.speaker or req.voice or "Ono_Anna"),
-                "speed": req.speed or 1.0,
-            },
+            qwen3_payload,
             24000,
         )
     if backend == "sbv2":
