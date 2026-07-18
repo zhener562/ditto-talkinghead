@@ -618,6 +618,7 @@ class DittoTtsAvatarRequest(BaseModel):
     speed: Optional[float] = 1.0
     lang: Optional[str] = "j"
     caption: Optional[str] = None  # irodori
+    instruct: Optional[str] = None  # qwen3 (演技指示。persona instruct + {{VOICE}} 合成済み)
     speaker: Optional[str | int] = None  # voicevox | qwen3
     model_id: Optional[int] = None  # sbv2
     speaker_id: Optional[int] = None  # sbv2
@@ -698,6 +699,8 @@ def _build_tts_request(req: DittoTtsAvatarRequest) -> tuple[str, dict, int]:
         # its own default (True)".
         if req.split_mixed_languages is not None:
             qwen3_payload["split_mixed_languages"] = req.split_mixed_languages
+        if req.instruct:
+            qwen3_payload["instruct"] = req.instruct
         return (
             f"{TTS_SERVER_URL}/qwen3/tts/stream",
             qwen3_payload,
