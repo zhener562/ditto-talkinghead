@@ -626,6 +626,9 @@ class DittoTtsAvatarRequest(BaseModel):
     language: Optional[str] = None  # xtts
     num_steps: Optional[int] = None  # irodori
     seed: Optional[int] = None  # irodori (固定すると音声を決定論化、None で毎回ランダム)
+    # irodori: 登録済み参照音声 ID。指定すると tts_server が caption 駆動の VoiceDesign
+    # ではなくリファレンス駆動のチェックポイントで合成し、チャンク境界で声が変わらなくなる。
+    ref_id: Optional[str] = None
     fps: Optional[int] = FPS
     jpeg_quality: Optional[int] = 85
     # qwen3-only: forwarded to tts_server's Qwen3TTSRequest. Server-side
@@ -729,6 +732,7 @@ def _build_tts_request(req: DittoTtsAvatarRequest) -> tuple[str, dict, int]:
                 "speed": req.speed or 1.0,
                 "num_steps": req.num_steps or 20,
                 "seed": req.seed,
+                "ref_id": req.ref_id,
             },
             48000,
         )
