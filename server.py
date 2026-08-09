@@ -613,13 +613,14 @@ async def ditto_benchmark(avatar_id: str = "default", duration_s: float = 2.0):
 class DittoTtsAvatarRequest(BaseModel):
     text: str
     avatar_id: str
-    tts_backend: Optional[str] = "kokoro"  # kokoro | voicevox | aivis | xtts | qwen3 | sbv2 | irodori | voxcpm
+    # qwen3 is accepted as a legacy alias and normalized to voxcpm.
+    tts_backend: Optional[str] = "voxcpm"
     voice: Optional[str] = None
     speed: Optional[float] = 1.0
     lang: Optional[str] = "j"
     caption: Optional[str] = None  # irodori
-    instruct: Optional[str] = None  # qwen3 (演技指示。persona instruct + {{VOICE}} 合成済み)
-    speaker: Optional[str | int] = None  # voicevox | qwen3
+    instruct: Optional[str] = None  # voxcpm (persona instruct + {{VOICE}})
+    speaker: Optional[str | int] = None  # voicevox / legacy clients
     model_id: Optional[int] = None  # sbv2
     speaker_id: Optional[int] = None  # sbv2
     style: Optional[str] = None  # sbv2
@@ -637,12 +638,7 @@ class DittoTtsAvatarRequest(BaseModel):
     voxcpm_ref_id: Optional[str] = None
     fps: Optional[int] = FPS
     jpeg_quality: Optional[int] = 85
-    # qwen3-only: forwarded to tts_server's Qwen3TTSRequest. Server-side
-    # default is True (JA+EN mixed text splits into per-language runs
-    # for accurate pronunciation), at the cost of disabling chunk
-    # streaming on mixed input. Clients (e.g. kotonia-desktop's Iris
-    # coding persona) that prefer streaming first-byte latency over
-    # per-language pronunciation pass False.
+    # Kept only so old desktop payloads still validate; VoxCPM2 ignores it.
     split_mixed_languages: Optional[bool] = None
 
 
@@ -653,7 +649,9 @@ def _build_tts_request(req: DittoTtsAvatarRequest) -> tuple[str, dict, int]:
     the WAV header per chunk. tts_server always prepends a WAV header so
     soundfile can recover the true rate regardless.
     """
-    backend = (req.tts_backend or "kokoro").lower()
+    backend = (req.tts_backend or "voxcpm").lower()
+    if backend == "qwen3":
+        backend = "voxcpm"
     if backend == "kokoro":
         return (
             f"{TTS_SERVER_URL}/tts/stream",
@@ -694,25 +692,6 @@ def _build_tts_request(req: DittoTtsAvatarRequest) -> tuple[str, dict, int]:
                 "language": req.language or "ja",
                 "speed": req.speed or 1.0,
             },
-            24000,
-        )
-    if backend == "qwen3":
-        qwen3_payload = {
-            "text": req.text,
-            "language": req.language or "ja",
-            "speaker": str(req.speaker or req.voice or "Ono_Anna"),
-            "speed": req.speed or 1.0,
-        }
-        # Forward the streaming-vs-fluency knob when the caller set it.
-        # `None` means "leave it off the wire and let tts_server use
-        # its own default (True)".
-        if req.split_mixed_languages is not None:
-            qwen3_payload["split_mixed_languages"] = req.split_mixed_languages
-        if req.instruct:
-            qwen3_payload["instruct"] = req.instruct
-        return (
-            f"{TTS_SERVER_URL}/qwen3/tts/stream",
-            qwen3_payload,
             24000,
         )
     if backend == "sbv2":
@@ -771,14 +750,23 @@ def _split_sentences_for_chunky_tts(text: str) -> list[str]:
     return [p.strip() for p in parts if p and p.strip()]
 
 
-_QWEN3_DITTO_BUFFER_INITIAL_SEC = float(
-    os.environ.get("QWEN3_DITTO_BUFFER_INITIAL_SEC", "1.0")
+_VOXCPM_DITTO_BUFFER_INITIAL_SEC = float(
+    os.environ.get(
+        "VOXCPM_DITTO_BUFFER_INITIAL_SEC",
+        os.environ.get("QWEN3_DITTO_BUFFER_INITIAL_SEC", "1.0"),
+    )
 )
-_QWEN3_DITTO_BUFFER_GROWTH = float(
-    os.environ.get("QWEN3_DITTO_BUFFER_GROWTH", "1.5")
+_VOXCPM_DITTO_BUFFER_GROWTH = float(
+    os.environ.get(
+        "VOXCPM_DITTO_BUFFER_GROWTH",
+        os.environ.get("QWEN3_DITTO_BUFFER_GROWTH", "1.5"),
+    )
 )
-_QWEN3_DITTO_BUFFER_MAX_SEC = float(
-    os.environ.get("QWEN3_DITTO_BUFFER_MAX_SEC", "3.0")
+_VOXCPM_DITTO_BUFFER_MAX_SEC = float(
+    os.environ.get(
+        "VOXCPM_DITTO_BUFFER_MAX_SEC",
+        os.environ.get("QWEN3_DITTO_BUFFER_MAX_SEC", "3.0"),
+    )
 )
 
 
@@ -789,34 +777,9 @@ def _merge_parts_to_wav(parts: list[np.ndarray], sample_rate: int) -> bytes:
     return out.getvalue()
 
 
-def _stream_qwen3_buffered_for_ditto(req: DittoTtsAvatarRequest):
-    """qwen3 を**全文 1 コール**で呼び、ストリーム出力を時間単位に束ねて Ditto に渡す。
-
-    文単位コールだと自己回帰状態が文ごとにリセットされて話者の声質・プロソディが
-    微妙に揺れる（vLLM-Omni のサンプリング乱数も別シード扱い）。全文を 1 回の
-    generate に通すことで decoder 状態を連続させたまま、Ditto 側の offline
-    パイプライン粒度だけを時間バッファで粗くする。
-
-    バッファ長は初回 `_QWEN3_DITTO_BUFFER_INITIAL_SEC` から `_QWEN3_DITTO_BUFFER_GROWTH`
-    倍ずつ成長させ、`_QWEN3_DITTO_BUFFER_MAX_SEC` で頭打ち。理由:
-      - 初回は TTFA 短縮のため小さめ
-      - Ditto RTF 0.5 なので後続チャンクを成長させても再生が追い付く
-      - 上限ありなので割り込み時の render ロスが限定される
-    """
-    url = f"{TTS_SERVER_URL}/qwen3/tts/stream"
-    payload = {
-        "text": req.text,
-        "language": req.language or "ja",
-        "speaker": str(req.speaker or req.voice or "Ono_Anna"),
-        "speed": req.speed or 1.0,
-    }
-    yield from _stream_buffered_for_ditto(url, payload)
-
-
 def _stream_voxcpm_buffered_for_ditto(req: "DittoTtsAvatarRequest"):
     """VoxCPM2 を**全文 1 コール**で呼び、時間単位に束ねて Ditto に渡す。
 
-    qwen3 と同じ扱いにする理由は実測 (docs/VOXCPM2_MIGRATION_PLAN.md §4.5):
     VoxCPM2 の Voice Design は「記述からサンプリングで声が立ち上がる」型なので、
     文単位で別コールすると声が引き直される。別コール・別の文の MFCC 距離は
     **0.1231** で、別キャラとして設計した 2 人の距離 (0.1259) とほぼ同じ =
@@ -842,8 +805,8 @@ def _stream_voxcpm_buffered_for_ditto(req: "DittoTtsAvatarRequest"):
 def _stream_buffered_for_ditto(url: str, payload: dict):
     """length-prefixed multi-WAV を読み、時間単位に束ね直して yield する。
 
-    バッファ長は初回 `_QWEN3_DITTO_BUFFER_INITIAL_SEC` から `_QWEN3_DITTO_BUFFER_GROWTH`
-    倍ずつ成長させ `_QWEN3_DITTO_BUFFER_MAX_SEC` で頭打ち。初回を小さくして TTFA を稼ぎ、
+    バッファ長は初回 `_VOXCPM_DITTO_BUFFER_INITIAL_SEC` から `_VOXCPM_DITTO_BUFFER_GROWTH`
+    倍ずつ成長させ `_VOXCPM_DITTO_BUFFER_MAX_SEC` で頭打ち。初回を小さくして TTFA を稼ぎ、
     後続を大きくして Ditto の render 効率を上げる。
     """
     data = json.dumps(payload).encode("utf-8")
@@ -864,7 +827,7 @@ def _stream_buffered_for_ditto(url: str, payload: dict):
     buf_parts: list[np.ndarray] = []
     buf_samples = 0
     sample_rate: Optional[int] = None
-    target_sec = _QWEN3_DITTO_BUFFER_INITIAL_SEC
+    target_sec = _VOXCPM_DITTO_BUFFER_INITIAL_SEC
     with resp:
         buf = bytearray()
         while True:
@@ -889,18 +852,15 @@ def _stream_buffered_for_ditto(url: str, payload: dict):
                     buf_parts = []
                     buf_samples = 0
                     target_sec = min(
-                        target_sec * _QWEN3_DITTO_BUFFER_GROWTH,
-                        _QWEN3_DITTO_BUFFER_MAX_SEC,
+                        target_sec * _VOXCPM_DITTO_BUFFER_GROWTH,
+                        _VOXCPM_DITTO_BUFFER_MAX_SEC,
                     )
     if buf_parts and sample_rate is not None:
         yield _merge_parts_to_wav(buf_parts, sample_rate)
 
 
 def _stream_chunky_tts_per_sentence(req: DittoTtsAvatarRequest):
-    """XTTS を文単位へ束ねて Ditto に渡す（voice clone 参照音声が固定のため
-    文ごと別コールでも声質は安定）。qwen3 は自己回帰の連続性を保つため
-    `_stream_qwen3_buffered_for_ditto` で処理するので通らない。
-    """
+    """XTTS を文単位へ束ねて Ditto に渡す legacy helper。"""
     backend = (req.tts_backend or "kokoro").lower()
     sentences = _split_sentences_for_chunky_tts(req.text)
     if not sentences:
@@ -958,12 +918,11 @@ def _stream_chunky_tts_per_sentence(req: DittoTtsAvatarRequest):
 
 def _stream_tts_wavs(req: DittoTtsAvatarRequest):
     """Yield (wav_bytes) per sentence from tts_server. Blocking generator."""
-    backend = (req.tts_backend or "kokoro").lower()
+    backend = (req.tts_backend or "voxcpm").lower()
     if backend == "qwen3":
-        yield from _stream_qwen3_buffered_for_ditto(req)
-        return
+        backend = "voxcpm"
     if backend == "voxcpm":
-        # qwen3 と同じ全文 1 コール。文単位だと声が引き直される (実測 MFCC 0.1231)
+        # 全文 1 コール。文単位だと声が引き直される (実測 MFCC 0.1231)
         yield from _stream_voxcpm_buffered_for_ditto(req)
         return
     if backend == "xtts":
