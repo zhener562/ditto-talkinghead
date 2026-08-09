@@ -613,7 +613,7 @@ async def ditto_benchmark(avatar_id: str = "default", duration_s: float = 2.0):
 class DittoTtsAvatarRequest(BaseModel):
     text: str
     avatar_id: str
-    tts_backend: Optional[str] = "kokoro"  # kokoro | voicevox | aivis | xtts | qwen3 | sbv2 | irodori
+    tts_backend: Optional[str] = "kokoro"  # kokoro | voicevox | aivis | xtts | qwen3 | sbv2 | irodori | voxcpm
     voice: Optional[str] = None
     speed: Optional[float] = 1.0
     lang: Optional[str] = "j"
@@ -629,6 +629,12 @@ class DittoTtsAvatarRequest(BaseModel):
     # irodori: 登録済み参照音声 ID。指定すると tts_server が caption 駆動の VoiceDesign
     # ではなくリファレンス駆動のチェックポイントで合成し、チャンク境界で声が変わらなくなる。
     ref_id: Optional[str] = None
+    # voxcpm: キャラの声を決める自然言語記述 (Voice Design)。
+    design: Optional[str] = None
+    # voxcpm: 登録済み参照音声 ID。irodori の ref_id とは別レジストリなので
+    # フィールドを分けてある (取り違えると別エンジンの声を引きに行く)。
+    # 指定するとコールをまたいで声が固定される。
+    voxcpm_ref_id: Optional[str] = None
     fps: Optional[int] = FPS
     jpeg_quality: Optional[int] = 85
     # qwen3-only: forwarded to tts_server's Qwen3TTSRequest. Server-side
@@ -723,6 +729,24 @@ def _build_tts_request(req: DittoTtsAvatarRequest) -> tuple[str, dict, int]:
             },
             44100,
         )
+    if backend == "voxcpm":
+        # 実際のストリームは `_stream_voxcpm_buffered_for_ditto` が全文 1 コールで
+        # 引くのでこの payload は使われないが、`/ditto/tts/stream/avatar` は
+        # sample-rate hint を取るためだけにこの関数を呼ぶ (server.py:1137)。
+        # ここに分岐が無いと「unknown tts_backend」で 400 になる。
+        return (
+            f"{TTS_SERVER_URL}/voxcpm/tts/stream",
+            {
+                "text": req.text,
+                "design": req.design or "",
+                "instruct": req.instruct or "",
+                "ref_id": req.voxcpm_ref_id,
+                "seed": req.seed,
+                "speed": req.speed or 1.0,
+                "language": req.language,
+            },
+            48000,
+        )
     if backend == "irodori":
         return (
             f"{TTS_SERVER_URL}/irodori/tts/stream",
@@ -786,6 +810,42 @@ def _stream_qwen3_buffered_for_ditto(req: DittoTtsAvatarRequest):
         "speaker": str(req.speaker or req.voice or "Ono_Anna"),
         "speed": req.speed or 1.0,
     }
+    yield from _stream_buffered_for_ditto(url, payload)
+
+
+def _stream_voxcpm_buffered_for_ditto(req: "DittoTtsAvatarRequest"):
+    """VoxCPM2 を**全文 1 コール**で呼び、時間単位に束ねて Ditto に渡す。
+
+    qwen3 と同じ扱いにする理由は実測 (docs/VOXCPM2_MIGRATION_PLAN.md §4.5):
+    VoxCPM2 の Voice Design は「記述からサンプリングで声が立ち上がる」型なので、
+    文単位で別コールすると声が引き直される。別コール・別の文の MFCC 距離は
+    **0.1231** で、別キャラとして設計した 2 人の距離 (0.1259) とほぼ同じ =
+    同一キャラが文ごとに別人になる。
+
+    `voxcpm_ref_id` を渡すと参照音声で条件付けされて声が固定されるが、
+    それでも全文 1 コールのほうが安定するのでここでは分割しない。
+    """
+    url = f"{TTS_SERVER_URL}/voxcpm/tts/stream"
+    payload = {
+        "text": req.text,
+        "design": req.design or "",
+        "instruct": req.instruct or "",
+        "ref_id": req.voxcpm_ref_id,
+        "seed": req.seed,
+        "speed": req.speed or 1.0,
+        "language": req.language,
+        "speaker": str(req.speaker) if req.speaker is not None else None,
+    }
+    yield from _stream_buffered_for_ditto(url, payload)
+
+
+def _stream_buffered_for_ditto(url: str, payload: dict):
+    """length-prefixed multi-WAV を読み、時間単位に束ね直して yield する。
+
+    バッファ長は初回 `_QWEN3_DITTO_BUFFER_INITIAL_SEC` から `_QWEN3_DITTO_BUFFER_GROWTH`
+    倍ずつ成長させ `_QWEN3_DITTO_BUFFER_MAX_SEC` で頭打ち。初回を小さくして TTFA を稼ぎ、
+    後続を大きくして Ditto の render 効率を上げる。
+    """
     data = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
         url,
@@ -797,7 +857,7 @@ def _stream_qwen3_buffered_for_ditto(req: DittoTtsAvatarRequest):
         resp = urllib.request.urlopen(request, timeout=120)
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
-        raise HTTPException(502, f"tts_server qwen3 HTTP {e.code}: {body}") from e
+        raise HTTPException(502, f"tts_server {url} HTTP {e.code}: {body}") from e
     except urllib.error.URLError as e:
         raise HTTPException(502, f"tts_server unreachable: {e}") from e
 
@@ -901,6 +961,10 @@ def _stream_tts_wavs(req: DittoTtsAvatarRequest):
     backend = (req.tts_backend or "kokoro").lower()
     if backend == "qwen3":
         yield from _stream_qwen3_buffered_for_ditto(req)
+        return
+    if backend == "voxcpm":
+        # qwen3 と同じ全文 1 コール。文単位だと声が引き直される (実測 MFCC 0.1231)
+        yield from _stream_voxcpm_buffered_for_ditto(req)
         return
     if backend == "xtts":
         yield from _stream_chunky_tts_per_sentence(req)
