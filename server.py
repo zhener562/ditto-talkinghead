@@ -470,6 +470,51 @@ def ditto_list_avatars():
     return out
 
 
+class DittoValidateRequest(BaseModel):
+    avatar_id: str
+
+
+@app.post("/ditto/validate")
+def ditto_validate(req: DittoValidateRequest):
+    """この画像がリップシンク元として使えるかを、実際に顔登録して確かめる。
+
+    `/ditto/prepare` はファイルを置くだけで顔を見ていないので、顔が写っていない
+    画像でも成功する。失敗が出るのは **喋らせた瞬間** で、しかもそのターンの
+    音声ごと落ちる (worker が例外で止まる)。登録した側には何が悪いのか分からない。
+
+    ここで使う kwargs は `StreamSDK.setup` の既定値と同じものを並べてある。
+    `avatar_registrar` のキャッシュキーは (path, max_dim, crop_*) なので、
+    **検証に成功すると本番が使うキャッシュがそのまま温まる** = 初回の顔登録が省ける。
+    `n_frames` はキーに入っていないので 1 でよい。
+    """
+    sdk = _require_ready()
+    src_path = _resolve_source(req.avatar_id)
+    if src_path is None:
+        raise HTTPException(404, f"Avatar '{req.avatar_id}' not prepared")
+    with _sdk_lock:
+        try:
+            sdk.avatar_registrar(
+                src_path,
+                max_dim=1920,
+                n_frames=1,
+                crop_scale=2.3,
+                crop_vx_ratio=0,
+                crop_vy_ratio=-0.125,
+                crop_flag_do_rot=True,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("validate failed avatar_id=%s: %s", req.avatar_id, e)
+            # 顔が取れないと source2info の _crop が None を返し、呼び出し側で
+            # unpack に失敗する。これが実運用でいちばん多い失敗なので名前を付ける。
+            reason = (
+                "no_face_detected"
+                if "NoneType" in str(e)
+                else f"{type(e).__name__}: {e}"
+            )
+            return {"ok": False, "reason": reason}
+    return {"ok": True, "reason": None}
+
+
 @app.delete("/ditto/avatars/{avatar_id}")
 def ditto_delete_avatar(avatar_id: str):
     removed_cache = _avatars.pop(avatar_id, None) is not None
@@ -1068,6 +1113,11 @@ async def ditto_tts_stream_avatar(req: DittoTtsAvatarRequest):
                 total_frames = 0
                 sentence_idx = 0
 
+                # 顔が取れないアバターでも **音声だけは最後まで流す**。
+                # 以前はここで例外が上がるとループごと止まり、1 個目のチャンクしか
+                # 届かなかった = そのキャラの台詞がほぼ丸ごと消えていた。
+                # リップシンクは飾りで、台詞は本体。落とす順番を逆にしない。
+                render_broken = False
                 for wav_bytes in _stream_tts_wavs(req):
                     push(TYPE_AUDIO + struct.pack(">I", len(wav_bytes)) + wav_bytes)
 
@@ -1076,7 +1126,21 @@ async def ditto_tts_stream_avatar(req: DittoTtsAvatarRequest):
                     total_audio_ms += audio_ms
 
                     t_sentence = time.perf_counter()
-                    n = _run_sentence_offline(sdk, src_path, audio16k, jpeg_quality, push)
+                    if render_broken:
+                        sentence_idx += 1
+                        continue
+                    try:
+                        n = _run_sentence_offline(sdk, src_path, audio16k, jpeg_quality, push)
+                    except Exception as e:  # noqa: BLE001
+                        # 1 文目で駄目なら以降も駄目 (同じ source を使うので)。
+                        # 毎文スタックトレースを吐くと journald が埋まるので 1 回だけ。
+                        render_broken = True
+                        n = 0
+                        logger.error(
+                            "combined: render failed for avatar=%s, continuing audio-only: %s",
+                            req.avatar_id,
+                            e,
+                        )
                     total_frames += n
                     sentence_idx += 1
                     logger.info(
