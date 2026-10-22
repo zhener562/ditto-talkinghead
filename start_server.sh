@@ -18,7 +18,7 @@ import fastapi, uvicorn, multipart  # noqa: F401
 PY
 
 PORT="${DITTO_PORT:-8881}"
-HOST="${DITTO_HOST:-0.0.0.0}"
+HOST="${DITTO_HOST:-127.0.0.1}"  # LAN に晒さない。外から叩く必要があれば DITTO_HOST=0.0.0.0
 
 # Pin to GPU 0 (音声聖域)。重バッチ (LLM / HiDream) は GPU1 に隔離してあるので
 # SM 競合は起きない。2026-08-31 に GPU1 から移した: GPU1 の PCIe が x2 で
