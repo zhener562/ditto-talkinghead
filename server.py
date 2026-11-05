@@ -223,7 +223,17 @@ def _cache_set(avatar_id: str, src_path: str) -> None:
         logger.info("[AvatarCache] evicted '%s'", evicted_id)
 
 
+_AVATAR_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
+
+
+def _is_valid_avatar_id(avatar_id: str) -> bool:
+    # avatar_id becomes a directory name under AVATARS_DIR.
+    return _AVATAR_ID_RE.fullmatch(avatar_id) is not None
+
+
 def _resolve_source(avatar_id: str) -> Optional[str]:
+    if not _is_valid_avatar_id(avatar_id):
+        return None
     if avatar_id in _avatars:
         _avatars.move_to_end(avatar_id)
         return _avatars[avatar_id]
@@ -337,6 +347,8 @@ def _encode_jpeg(rgb: np.ndarray, quality: int) -> Optional[bytes]:
 
 
 def _save_avatar_source(avatar_id: str, filename: str, content: bytes) -> str:
+    if not _is_valid_avatar_id(avatar_id):
+        raise HTTPException(400, "invalid avatar_id")
     suffix = (Path(filename or "").suffix or ".png").lower()
     if suffix not in IMAGE_EXTS:
         raise HTTPException(400, f"unsupported extension: {suffix}")
@@ -517,6 +529,8 @@ def ditto_validate(req: DittoValidateRequest):
 
 @app.delete("/ditto/avatars/{avatar_id}")
 def ditto_delete_avatar(avatar_id: str):
+    if not _is_valid_avatar_id(avatar_id):
+        raise HTTPException(400, "invalid avatar_id")
     removed_cache = _avatars.pop(avatar_id, None) is not None
     avatar_dir = AVATARS_DIR / avatar_id
     removed_disk = False
