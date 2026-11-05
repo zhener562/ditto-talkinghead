@@ -62,7 +62,7 @@ class Source2Info:
 
         # InsightFace's models are for non-commercial research only, so they are
         # imported and loaded only when asked for. See core/utils/face_init.py.
-        self.use_insightface = os.environ.get("DITTO_FACE_INIT", "insightface") == "insightface"
+        self.use_insightface = os.environ.get("DITTO_FACE_INIT", "blaze") == "insightface"
         if self.use_insightface:
             from ..aux_models.insightface_det import InsightFaceDet
             from ..aux_models.insightface_landmark106 import Landmark106
