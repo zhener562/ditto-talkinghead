@@ -42,7 +42,7 @@ import numpy as np
 import soundfile as sf
 import torch
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 
 import json
 import re
@@ -409,6 +409,7 @@ def _run_generate_mp4(avatar_id: str, audio: np.ndarray, output_path: Path) -> d
     return {
         "avatar_id": avatar_id,
         "output_path": str(output_path),
+        "output_url": f"/ditto/outputs/{output_path.name}",
         "fps": FPS,
         "num_frames": num_f,
         "elapsed_seconds": round(elapsed, 3),
@@ -418,6 +419,15 @@ def _run_generate_mp4(avatar_id: str, audio: np.ndarray, output_path: Path) -> d
 
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────
+
+
+@app.get("/ditto/outputs/{filename}")
+def ditto_output_file(filename: str):
+    root = (OUTPUTS_DIR / "studio").resolve()
+    path = (root / filename).resolve()
+    if path.parent != root or not filename.endswith(".mp4") or not path.is_file():
+        raise HTTPException(404, "Output video not found")
+    return FileResponse(path, media_type="video/mp4")
 
 
 @app.get("/health")
