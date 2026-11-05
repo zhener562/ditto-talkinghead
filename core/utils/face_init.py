@@ -27,6 +27,9 @@ from .crop import crop_image
 WINDOW_FRACTIONS = (1.0, 0.66, 0.45, 0.3)
 MIN_WINDOW_PX = 96
 START_SCALES = (1.0, 1.5, 0.7)
+# BlazeFace's box sits high on illustrated faces, around the large eyes and fringe,
+# and landmark203 does not recover from that. Tried only when nothing else passes.
+LOWERED_STARTS = ((1.25, 0.2), (1.5, 0.3), (1.0, 0.2))  # (scale, shift down / box height)
 ROTATIONS = (45, -45, 90, -90)
 MAX_BOXES = 4
 SETTLE_STEPS = 5
@@ -99,10 +102,10 @@ def detect_boxes(blaze, img):
     return kept
 
 
-def rough_points(box, scale=1.0):
+def rough_points(box, scale=1.0, shift_down=0.0):
     """Five upright points for `crop_image`. Only their position and size matter."""
     _, x1, y1, x2, y2 = box
-    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2 + (y2 - y1) * shift_down
     h = (y2 - y1) * scale
     eye = np.array([cx, cy - 0.18 * h], np.float32)
     lip = np.array([cx, cy + 0.26 * h], np.float32)
@@ -168,28 +171,40 @@ class FaceInit:
                 break
         return lmk, movement
 
+    def _try_start(self, img, box, scale, shift_down, to_original, best):
+        points = rough_points(box, scale, shift_down)
+        if to_original is not None:
+            points = cv2.transform(points[None], to_original)[0]
+        lmk, movement = self._settle(img, points)
+        presence, disagreement, accepted = self._check(img, lmk)
+        key = (not accepted, -presence)
+        if best is None or key < best["key"]:
+            best = {
+                "key": key,
+                "lmk": lmk,
+                "score": box[0],
+                "movement": movement,
+                "presence": presence,
+                "disagreement": disagreement,
+                "accepted": accepted,
+            }
+        return best, movement < CONVERGED and accepted
+
     def _best_from(self, img, view, to_original=None):
         best = None
-        for box in detect_boxes(self.blaze, view):
+        boxes = detect_boxes(self.blaze, view)
+        for box in boxes:
             for scale in START_SCALES:
-                points = rough_points(box, scale)
-                if to_original is not None:
-                    points = cv2.transform(points[None], to_original)[0]
-                lmk, movement = self._settle(img, points)
-                presence, disagreement, accepted = self._check(img, lmk)
-                key = (not accepted, -presence)
-                if best is None or key < best["key"]:
-                    best = {
-                        "key": key,
-                        "lmk": lmk,
-                        "score": box[0],
-                        "movement": movement,
-                        "presence": presence,
-                        "disagreement": disagreement,
-                        "accepted": accepted,
-                    }
-                if movement < CONVERGED and accepted:
+                best, done = self._try_start(img, box, scale, 0.0, to_original, best)
+                if done:
                     break
+        if best is None or best["accepted"]:
+            return best
+        for box in boxes:
+            for scale, shift_down in LOWERED_STARTS:
+                best, done = self._try_start(img, box, scale, shift_down, to_original, best)
+                if done:
+                    return best
         return best
 
     def candidate(self, img):
