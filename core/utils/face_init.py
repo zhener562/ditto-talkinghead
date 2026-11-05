@@ -11,10 +11,12 @@ its result stops moving.
 
 `landmark203` settles on a face-like shape even on a car, and BlazeFace's score
 overlaps between faces and objects, so neither can say whether there is a face.
-Three checks on the aligned crop decide that instead: FaceMesh's presence output,
-BlazeFace finding a face there (the eye step needs this anyway), and FaceMesh and
-`landmark203` agreeing on where the eyes are. Presence alone is not enough:
-taking the best of many starts lets some start pass by chance.
+Checks on the aligned crop decide that instead: FaceMesh's presence output,
+FaceMesh and `landmark203` agreeing on where the eyes are, and BlazeFace finding
+a box of the right size there with a good score. On a real face that box fits the
+landmarks; a false accept is a magnified bit of background and the box is far too
+large. Presence alone is not enough: taking the best of many starts lets some
+start pass by chance.
 """
 
 import cv2
@@ -31,6 +33,8 @@ SETTLE_STEPS = 5
 CONVERGED = 0.01  # mean landmark movement / interocular distance
 MIN_PRESENCE = 0.0  # FaceMesh logit
 MAX_EYE_DISAGREEMENT = 0.15  # distance between the two models / interocular distance
+MIN_RECHECK_SCORE = 0.56  # BlazeFace on the aligned crop
+MAX_RECHECK_SIZE = 1.28  # BlazeFace box width / landmark extent on the aligned crop
 
 
 def _pad_square(img):
@@ -135,10 +139,15 @@ class FaceInit:
             np.linalg.norm(mesh_a - eye_a) + np.linalg.norm(mesh_b - eye_b),
             np.linalg.norm(mesh_a - eye_b) + np.linalg.norm(mesh_b - eye_a),
         ) / (2 * interocular)
+        boxes = self.blaze(image)
+        recheck = max(boxes, key=lambda box: box[-1]) if len(boxes) else None
         accepted = bool(
             presence > self.min_presence
             and disagreement <= MAX_EYE_DISAGREEMENT
-            and len(self.blaze(image)) > 0
+            and recheck is not None
+            and recheck[-1] >= MIN_RECHECK_SCORE
+            and (recheck[2] - recheck[0]) * 512 / 128.0 / np.ptp(points, axis=0).max()
+            <= MAX_RECHECK_SIZE
         )
         return presence, float(disagreement), accepted
 
