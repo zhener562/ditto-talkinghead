@@ -76,6 +76,8 @@ class FaceMesh:
                 outputs[name] = self.model.buffer[name][0]
         else:
             raise ValueError(f"Unsupported model type: {self.model_type}")
+        # Logit of "this ROI contains a face". Above 0 means a face.
+        self.last_presence = float(np.ravel(outputs["Identity_1"])[0])
         points = outputs["Identity"].reshape(1434 // 3, 3)
         points = self.project_landmarks(points, roi)
         return points

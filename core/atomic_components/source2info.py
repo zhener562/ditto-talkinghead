@@ -1,8 +1,8 @@
+import os
+
 import numpy as np
 import cv2
 
-from ..aux_models.insightface_det import InsightFaceDet
-from ..aux_models.insightface_landmark106 import Landmark106
 from ..aux_models.landmark203 import Landmark203
 from ..aux_models.mediapipe_landmark478 import Landmark478
 from ..models.appearance_extractor import AppearanceExtractor
@@ -10,6 +10,7 @@ from ..models.motion_extractor import MotionExtractor
 
 from ..utils.crop import crop_image
 from ..utils.eye_info import EyeAttrUtilsByMP
+from ..utils.face_init import FaceInit
 
 
 """
@@ -56,35 +57,52 @@ class Source2Info:
         appearance_extractor_cfg,
         motion_extractor_cfg,
     ):
-        self.insightface_det = InsightFaceDet(**insightface_det_cfg)
-        self.landmark106 = Landmark106(**landmark106_cfg)
         self.landmark203 = Landmark203(**landmark203_cfg)
         self.landmark478 = Landmark478(**landmark478_cfg)
+
+        # InsightFace's models are for non-commercial research only, so they are
+        # imported and loaded only when asked for. See core/utils/face_init.py.
+        self.use_insightface = os.environ.get("DITTO_FACE_INIT", "insightface") == "insightface"
+        if self.use_insightface:
+            from ..aux_models.insightface_det import InsightFaceDet
+            from ..aux_models.insightface_landmark106 import Landmark106
+
+            self.insightface_det = InsightFaceDet(**insightface_det_cfg)
+            self.landmark106 = Landmark106(**landmark106_cfg)
+        else:
+            self.face_init = FaceInit(
+                self.landmark478.blaze_face, self.landmark478.face_mesh, self.landmark203
+            )
 
         self.appearance_extractor = AppearanceExtractor(**appearance_extractor_cfg)
         self.motion_extractor = MotionExtractor(**motion_extractor_cfg)
 
     def _crop(self, img, last_lmk=None, **kwargs):
-        # img_rgb -> det->landmark106->landmark203->crop
+        # img_rgb -> find face->landmark203->crop
 
-        if last_lmk is None:  # det for first frame or image
-            det, _ = self.insightface_det(img)
-            boxes = det[np.argsort(-(det[:, 2] - det[:, 0]) * (det[:, 3] - det[:, 1]))]
-            if len(boxes) == 0:
+        if last_lmk is None and not self.use_insightface:
+            lmk203 = self.face_init(img)
+            if lmk203 is None:
                 return None
-            lmk_for_track = self.landmark106(img, boxes[0])  # 106
-        else:  # track for video frames
-            lmk_for_track = last_lmk  # 203
+        else:
+            if last_lmk is None:  # det for first frame or image
+                det, _ = self.insightface_det(img)
+                boxes = det[np.argsort(-(det[:, 2] - det[:, 0]) * (det[:, 3] - det[:, 1]))]
+                if len(boxes) == 0:
+                    return None
+                lmk_for_track = self.landmark106(img, boxes[0])  # 106
+            else:  # track for video frames
+                lmk_for_track = last_lmk  # 203
 
-        crop_dct = crop_image(
-            img,
-            lmk_for_track,
-            dsize=self.landmark203.dsize,
-            scale=1.5,
-            vy_ratio=-0.1,
-            pt_crop_flag=False,
-        )
-        lmk203 = self.landmark203(crop_dct["img_crop"], crop_dct["M_c2o"])
+            crop_dct = crop_image(
+                img,
+                lmk_for_track,
+                dsize=self.landmark203.dsize,
+                scale=1.5,
+                vy_ratio=-0.1,
+                pt_crop_flag=False,
+            )
+            lmk203 = self.landmark203(crop_dct["img_crop"], crop_dct["M_c2o"])
 
         ret_dct = crop_image(
             img,
